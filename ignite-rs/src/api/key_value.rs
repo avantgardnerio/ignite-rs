@@ -1,10 +1,14 @@
 use crate::cache::CachePeekMode;
 use crate::error::IgniteResult;
-use crate::protocol::{read_bool, read_i32, read_i64, write_i32, write_u8};
+use crate::protocol::{
+    read_bool, read_i32, read_i64, write_bool, write_i32, write_i64, write_i8, write_null,
+    write_string, write_u8, TypeCode,
+};
 use crate::{ReadableReq, ReadableType, WritableType, WriteableReq};
 
 use std::io;
 use std::io::{Read, Write};
+use std::mem::size_of;
 
 // https://apacheignite.readme.io/docs/binary-client-protocol-key-value-operations#op_cache_get
 const MAGIC_BYTE: u8 = 0;
@@ -32,6 +36,9 @@ pub(crate) enum CacheReq<'a, K: WritableType, V: WritableType> {
     GetSize(i32, Vec<CachePeekMode>),
     RemoveKeys(i32, &'a [K]),
     RemoveAll(i32),
+    QueryScan(i32, i32),                    // cache ID, page size,
+    QueryScanSql(i32, i32, String, String), // cache ID, page size, table/type, sql
+    QueryScanSqlFields(i32, i32, String),   // cache ID, page size, sql
 }
 
 impl<'a, K: WritableType, V: WritableType> WriteableReq for CacheReq<'a, K, V> {
@@ -104,6 +111,63 @@ impl<'a, K: WritableType, V: WritableType> WriteableReq for CacheReq<'a, K, V> {
                 }
                 Ok(())
             }
+            // https://ignite.apache.org/docs/latest/binary-client-protocol/sql-and-scan-queries#op_query_scan
+            CacheReq::QueryScan(id, pg_sz) => {
+                write_i32(writer, *id)?;
+                write_u8(writer, 1u8)?; // 1 to keep the value in binary form
+                write_null(writer)?; // Not possible to pass filter object unless Java or .NET
+                write_i32(writer, *pg_sz)?;
+                write_i32(writer, -1)?; // negative to query entire cache
+                write_bool(writer, false)?; // can be executed anywhere?
+                Ok(())
+            }
+            // https://ignite.apache.org/docs/latest/binary-client-protocol/sql-and-scan-queries#op_query_sql
+            CacheReq::QueryScanSql(id, pg_sz, table, sql) => {
+                write_i32(writer, *id)?;
+                write_u8(writer, 0)?; // Use 0. This field is deprecated and will be removed in the future.
+                write_u8(writer, TypeCode::String as u8)?;
+                write_string(writer, table.as_str())?;
+                write_u8(writer, TypeCode::String as u8)?;
+                write_string(writer, sql.as_str())?;
+                write_i32(writer, 0)?; // Argument count.
+                                       /*
+                                       TODO: Data Object
+                                       Query argument.
+                                       Repeat for as many times as the query argument count that is passed in the previous parameter.
+                                        */
+                write_bool(writer, false)?; // Distributed joins
+                write_bool(writer, false)?; // Local query.
+                write_bool(writer, false)?; // Replicated only - Whether query contains only replicated tables or not.
+                write_i32(writer, *pg_sz)?;
+                write_i64(writer, 10000)?; // Timeout (milliseconds).
+                Ok(())
+            }
+            // https://ignite.apache.org/docs/latest/binary-client-protocol/sql-and-scan-queries#op_query_sql_fields
+            CacheReq::QueryScanSqlFields(id, pg_sz, sql) => {
+                write_i32(writer, *id)?;
+                write_u8(writer, 0)?; // Use 0. This field is deprecated and will be removed in the future.
+                write_null(writer)?; // Schema for the query; can be null, in which case default PUBLIC schema will be used.
+                write_i32(writer, *pg_sz)?; // Query cursor page size.
+                write_i32(writer, *pg_sz)?; // Max rows.
+                write_u8(writer, TypeCode::String as u8)?;
+                write_string(writer, sql.as_str())?;
+                write_i32(writer, 0)?; // Argument count.
+                                       /*
+                                       TODO: Data Object
+                                       Query argument.
+                                       Repeat for as many times as the query argument count that is passed in the previous parameter.
+                                        */
+                write_i8(writer, 1)?; // Statement type. ANY = 0 SELECT = 1 UPDATE = 2
+                write_bool(writer, false)?; // Distributed joins
+                write_bool(writer, false)?; // Local query.
+                write_bool(writer, false)?; // Replicated only - Whether query contains only replicated tables or not.
+                write_bool(writer, false)?; // Enforce join order.
+                write_bool(writer, false)?; // Collocated - Whether your data is co-located or not.
+                write_bool(writer, false)?; // Lazy query execution.
+                write_i64(writer, 10000)?; // Timeout (milliseconds).
+                write_bool(writer, false)?; // Include field names.
+                Ok(())
+            }
         }
     }
 
@@ -155,6 +219,41 @@ impl<'a, K: WritableType, V: WritableType> WriteableReq for CacheReq<'a, K, V> {
                 }
                 size
             }
+            CacheReq::QueryScan(_, _) => {
+                CACHE_ID_MAGIC_BYTE_SIZE
+                + size_of::<u8>() // Filter object: Null
+                + size_of::<i32>() // Cursor page size
+                + size_of::<i32>() // Partition count
+                + size_of::<u8>() // local only flag
+            }
+            CacheReq::QueryScanSql(_, _, table, sql) => {
+                CACHE_ID_MAGIC_BYTE_SIZE
+                    + size_of::<i32>() + table.len() + size_of::<u8>()
+                    + size_of::<i32>() + sql.len() + size_of::<u8>()
+                    + size_of::<i32>() // Query argument count.
+                    + size_of::<u8>() // Distributed joins flag
+                    + size_of::<u8>() // Local query flag
+                    + size_of::<u8>() // Replicated only flag
+                    + size_of::<i32>() // Cursor page size
+                    + size_of::<i64>() // Timeout
+            }
+            CacheReq::QueryScanSqlFields(_, _, sql) => {
+                CACHE_ID_MAGIC_BYTE_SIZE
+                    + size_of::<u8>() // Null schema
+                    + size_of::<i32>() // Cursor page size
+                    + size_of::<i32>() // Max rows.
+                    + size_of::<i32>() + sql.len() + size_of::<u8>()
+                    + size_of::<i32>() // Argument count.
+                    + size_of::<u8>() // Statement type.
+                    + size_of::<u8>() // Distributed joins flag
+                    + size_of::<u8>() // Local query flag
+                    + size_of::<u8>() // Replicated only flag
+                    + size_of::<u8>() // Enforce join order flag
+                    + size_of::<u8>() // Collocated flag
+                    + size_of::<u8>() // Lazy query execution flag
+                    + size_of::<i64>() // Timeout
+                    + size_of::<u8>() // Include field names flag
+            }
         }
     }
 }
@@ -184,6 +283,25 @@ impl<K: ReadableType, V: ReadableType> ReadableReq for CachePairsResp<K, V> {
             pairs.push((key, val));
         }
         Ok(CachePairsResp { val: pairs })
+    }
+}
+
+pub(crate) struct QueryScanResp<K: ReadableType, V: ReadableType> {
+    pub(crate) val: Vec<(Option<K>, Option<V>)>,
+}
+
+impl<K: ReadableType, V: ReadableType> ReadableReq for QueryScanResp<K, V> {
+    fn read(reader: &mut impl Read) -> IgniteResult<Self> {
+        let _cursor_id = read_i64(reader)?;
+        let count = read_i32(reader)?;
+        let mut pairs: Vec<(Option<K>, Option<V>)> = Vec::new();
+        for _ in 0..count {
+            let key = K::read(reader)?;
+            let val = V::read(reader)?;
+            pairs.push((key, val));
+        }
+        let _more = read_bool(reader)?; // TODO: get more results
+        Ok(QueryScanResp { val: pairs })
     }
 }
 
